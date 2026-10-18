@@ -1,0 +1,189 @@
+<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8"><title>Scrollbar Rally 4D - Minimap Edition</title><style>
+    body { margin: 0; padding: 0; width: 4000px; height: 4000px; background: #111; font-family: monospace; overflow: scroll; user-select: none; }
+    ::-webkit-scrollbar { width: 45px; height: 45px; }
+    ::-webkit-scrollbar-track { background: #1a1a2e; border: 2px solid #333; }
+    ::-webkit-scrollbar-thumb { background: #00ffcc; border: 3px solid #111; box-shadow: 0 0 15px #00ffcc; }
+    #viewport { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; justify-content: center; align-items: center; overflow: hidden; background: radial-gradient(circle, #1a1a2e 0%, #111 100%); }
+    canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 1; cursor: grab; } canvas:active { cursor: grabbing; }
+    #ui { position: absolute; top: 60px; z-index: 10; text-align: center; pointer-events: none; }
+    h1 { margin: 0; font-size: 24px; color: #ff00ff; text-shadow: 0 0 10px #ff00ff; }
+    #status { font-size: 28px; font-weight: bold; color: #fff; margin-top: 5px; }
+    #instructions { color: #00ffcc; font-size: 13px; margin-top: 5px; background: rgba(0,0,0,0.8); padding: 6px 12px; border-radius: 5px; font-weight: bold; }
+    /* 左下に固定表示されるミニマップ用のキャンバス定義 */
+    #minimap { position: absolute; top: auto; bottom: 50px; left: 50px; width: 150px; height: 150px; background: rgba(0, 0, 0, 0.7); border: 2px solid #00ffcc; z-index: 15; pointer-events: none; border-radius: 4px; box-shadow: 0 0 10px rgba(0,255,204,0.3); }
+    .screen { display: none; position: absolute; z-index: 20; background: rgba(0, 0, 0, 0.95); padding: 30px; border: 4px solid #00ffcc; text-align: center; pointer-events: auto; }
+    #game-over { border-color: #ff3333; } #game-over h2 { color: #ff3333; margin: 0 0 10px 0; font-size: 40px; }
+    #game-clear { border-color: #00ffcc; } #game-clear h2 { color: #00ffcc; margin: 0 0 10px 0; font-size: 40px; }
+    button { background: #fff; color: #000; border: none; padding: 10px 25px; font-size: 18px; font-weight: bold; cursor: pointer; margin-top: 15px; transition: 0.2s; } button:hover { transform: scale(1.1); }
+    html.kbd-mode, html.kbd-mode body, html.kbd-mode canvas { cursor: none !important; }
+</style></head><body>
+
+    <div id="viewport">
+        
+        <canvas id="gameCanvas"></canvas>
+        <!-- 左下のミニマップ要素 -->
+        <canvas id="minimap" width="150" height="150"></canvas>
+        
+        <div id="ui">
+            <h1>SCROLLBAR RALLY 4D</h1><div id="status">SCORE: 0 / 10</div><div id="breakdown" style="font-size:14px; color:#ccc; margin-top:4px;"></div>
+            <div id="instructions">緑玉が飛来！右と下のバーで跳ね返して【赤玉】にし、ピンクの自機に当てろ！</div>
+        </div>
+        <div id="game-over" class="screen"><h2>GAME OVER</h2><div style="color:#fff;">緑玉が本体に直撃してしまった！</div><button onclick="resetGame()" style="background:#ff3333; color:#fff;">RETRY (Enter)</button></div>
+        <div id="game-clear" class="screen"><h2>STAGE CLEAR !!</h2><div style="color:#fff; font-weight:bold;">左上からの猛攻を凌ぎ、10ポイント獲得！</div><div id="clear-detail" style="color:#ccc; margin-top:8px;"></div><button onclick="resetGame()" style="background:#00ffcc; color:#000;">PLAY AGAIN (Enter)</button></div>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('gameCanvas'); const ctx = canvas.getContext('2d');
+        const mapCanvas = document.getElementById('minimap'); const mCtx = mapCanvas.getContext('2d');
+        const statusEl = document.getElementById('status'); const goScreen = document.getElementById('game-over'); const gcScreen = document.getElementById('game-clear');
+        
+        let playerX = window.innerWidth / 2, playerY = window.innerHeight / 2, playerRadius = 18, bullets = [], score = 0, isState = "PLAYING", isDragging = false, spawnInterval = 2400, lastSpawn = 0;
+
+        const BURST_COUNT = 5, REST_MS = 30000; // 操作エリア進入数の区切り／新規出現の停止時間(ms)。好みで調整
+        let enteredCount = 0, restUntil = 0;
+        const speedLabels = ["普通", "まずい", "うまい"]; // 添字＝速度種別(0:非常に遅い 1:中間 2:速い)
+        const displayOrder = [2, 1, 0]; // 表示順：うまい → まずい → 普通 let scoreByType = [0, 0, 0];
+        const breakdownEl = document.getElementById('breakdown'), clearDetailEl = document.getElementById('clear-detail');
+        function breakdownText() { return "内訳｜" + displayOrder.map(i => `${speedLabels[i]} ${scoreByType[i]}`).join("　") + `　＝　計 ${score}`; }
+        function resize() { canvas.width = window.innerWidth; canvas.height = window.innerHeight; }
+        window.addEventListener('resize', resize); resize();
+
+        function applyPos(x, y) {
+            if (isState !== "PLAYING") return;
+            playerX = Math.max(0, Math.min(canvas.width, x)); playerY = Math.max(0, Math.min(canvas.height, y));
+            const maxIdxX = document.documentElement.scrollWidth - document.documentElement.clientWidth, maxIdxY = document.documentElement.scrollHeight - document.documentElement.clientHeight;
+            window.scrollTo(Math.max(0, Math.min(maxIdxX, ((playerX - 50) / (canvas.width - 100)) * maxIdxX)), Math.max(0, Math.min(maxIdxY, ((playerY - 50) / (canvas.height - 100)) * maxIdxY)));
+        }
+        // マウスドラッグ操作（矢印キーと選択式：どちらでも操作可能）
+        function updatePos(e) { const rect = canvas.getBoundingClientRect(); applyPos(e.clientX - rect.left, e.clientY - rect.top); }
+        canvas.addEventListener('mousedown', (e) => { isDragging = true; updatePos(e); });
+        window.addEventListener('mousemove', (e) => { if (isDragging) updatePos(e); });
+        window.addEventListener('mouseup', () => isDragging = false);
+        // 矢印キー操作（ドラッグ相当：自機とスクロールバーが連動して動く）
+        const KEY_SPEED = 8; // 1フレームあたりの移動量(px)。好みで調整
+        const keys = { ArrowUp: false, ArrowDown: false, ArrowLeft: false, ArrowRight: false };
+        window.addEventListener('keydown', (e) => { if (e.key in keys) { keys[e.key] = true; e.preventDefault(); document.documentElement.classList.add('kbd-mode'); } });
+        // マウスを実際に動かす／クリックしたらポインタを再表示（スクロール由来の疑似mousemoveは無視）
+        const showCursor = () => document.documentElement.classList.remove('kbd-mode');
+        window.addEventListener('mousemove', (e) => { if (e.movementX !== 0 || e.movementY !== 0) showCursor(); });
+        window.addEventListener('mousedown', showCursor);
+        window.addEventListener('keyup', (e) => { if (e.key in keys) { keys[e.key] = false; e.preventDefault(); } });
+        window.addEventListener('keydown', (e) => { if (e.key === 'Enter' && isState !== "PLAYING") { e.preventDefault(); resetGame(); } });
+        window.addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
+        function handleKeyMove() {
+            const dx = (keys.ArrowRight ? 1 : 0) - (keys.ArrowLeft ? 1 : 0), dy = (keys.ArrowDown ? 1 : 0) - (keys.ArrowUp ? 1 : 0);
+            if (dx === 0 && dy === 0) return;
+            const n = (dx !== 0 && dy !== 0) ? Math.SQRT2 : 1; // 斜めも同じ速さ
+            applyPos(playerX + dx * KEY_SPEED / n, playerY + dy * KEY_SPEED / n);
+        }
+
+        // 【変更】赤玉を必ず左上方向（角度180度〜270度の範囲、画面の左上外側）から発生させる
+        function spawnBullet() {
+            if (isState !== "PLAYING") return;
+            // ミニマップの左上端（上辺 or 左辺）の座標をゲーム座標に変換して、そこから出現させる
+            const mScale = 0.035, mOx = mapCanvas.width - canvas.width * mScale / 2 - 4, mOy = mapCanvas.height - canvas.height * mScale / 2 - 4;
+            const minX = canvas.width / 2 + (2 - mOx) / mScale, minY = canvas.height / 2 + (2 - mOy) / mScale; // ミニマップ左端・上端
+            const topLen = canvas.width / 2 - minX, leftLen = canvas.height / 2 - minY;
+            let spX, spY;
+            if (Math.random() < topLen / (topLen + leftLen)) { spX = minX + Math.random() * topLen; spY = minY; } // 上辺
+            else { spX = minX; spY = minY + Math.random() * leftLen; } // 左辺
+            const sX = spX, sY = spY;
+            const dX = playerX - sX, dY = playerY - sY, len = Math.sqrt(dX * dX + dY * dY);
+            // 速度3種類：非常に遅い(約30秒) / 普通(約15秒) / 速い(約7秒) で自機に到達
+            const speedType = (() => { const r = Math.random() * 4; return r < 2 ? 0 : (r < 3 ? 1 : 2); })(); // 非常に遅い玉の出現数を2倍（比率 2:1:1） // 0:非常に遅い 1:普通 2:速い
+            const travelSec = [30, 15, 7][speedType];
+            const spd = len / (60 * travelSec);
+            if (len !== 0) bullets.push({ x: sX, y: sY, vx: (dX / len) * spd, vy: (dY / len) * spd, radius: 12, type: "in", speedType, initialDist: Math.hypot(sX - canvas.width / 2, sY - canvas.height / 2) });
+        }
+
+        function drawMinimap(bX, bY, bLen, thick, thickW, thickH) {
+            mCtx.clearRect(0, 0, mapCanvas.width, mapCanvas.height);
+            // 仮想の縮小率（ゲーム内空間を1/8にして表示）
+            const scale = 0.035; const cW = mapCanvas.width; const cH = mapCanvas.height;
+            const ox = cW - (canvas.width * scale) / 2 - 4, oy = cH - (canvas.height * scale) / 2 - 4; // 操作エリアの中心（右下寄せ）
+            
+            // プレイヤー（中央基準）と画面枠の描画
+            mCtx.fillStyle = 'rgba(0, 255, 204, 0.2)'; mCtx.fillRect(ox - (canvas.width*scale)/2, oy - (canvas.height*scale)/2, canvas.width*scale, canvas.height*scale);
+            mCtx.fillStyle = '#ff00ff'; mCtx.beginPath(); mCtx.arc(ox - (canvas.width/2 - playerX)*scale, oy - (canvas.height/2 - playerY)*scale, 3, 0, Math.PI*2); mCtx.fill();
+
+            // 弾（赤玉・緑玉）をミニマップ上にプロット
+            for (let b of bullets) {
+                const mapX = ox - (canvas.width/2 - b.x)*scale; const mapY = oy - (canvas.height/2 - b.y)*scale;
+                if (mapX >= 0 && mapX <= cW && mapY >= 0 && mapY <= cH) {
+                    mCtx.fillStyle = (b.type === "in" ? '#00ff66' : '#ff3333'); mCtx.beginPath(); mCtx.arc(mapX, mapY, 2, 0, Math.PI*2); mCtx.fill();
+                }
+            }
+        }
+
+        function gameLoop() {
+            if (isState !== "PLAYING") return;
+            statusEl.innerText = `SCORE: ${score} / 10`; breakdownEl.innerText = breakdownText();
+            if (score >= 10) { isState = "CLEAR"; clearDetailEl.innerText = breakdownText(); gcScreen.style.display = 'block'; return; }
+            
+            handleKeyMove();
+            const now = Date.now();
+            // 操作エリアに累計10発入るごとに、REST_MS の間は新規の玉（全速度）を出さない
+            if (now >= restUntil && (lastSpawn === 0 || now - lastSpawn > spawnInterval)) { spawnBullet(); lastSpawn = now; }
+
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.04)'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(playerX, 0); ctx.lineTo(playerX, canvas.height); ctx.moveTo(0, playerY); ctx.lineTo(canvas.width, playerY); ctx.stroke();
+
+            const de = document.documentElement, cw = de.clientWidth, ch = de.clientHeight, thick = 45;
+            const maxW = de.scrollWidth - cw, maxH = de.scrollHeight - ch;
+            // 実際のスクロールバーのつまみと同じ長さ・位置で当たり判定を計算
+            const lenX = Math.max(30, cw * cw / de.scrollWidth), lenY = Math.max(30, ch * ch / de.scrollHeight);
+            const tx0 = maxW > 0 ? window.scrollX / maxW * (cw - lenX) : 0, ty0 = maxH > 0 ? window.scrollY / maxH * (ch - lenY) : 0;
+            const tx1 = tx0 + lenX, ty1 = ty0 + lenY, bX = tx0 + lenX / 2, bY = ty0 + lenY / 2;
+            
+            
+
+            ctx.fillStyle = 'rgba(0, 255, 204, 0.45)';
+            ctx.fillRect(canvas.width - thick, ty0, thick, lenY); ctx.fillRect(tx0, canvas.height - thick, lenX, thick);
+            
+
+            ctx.beginPath(); ctx.arc(playerX, playerY, playerRadius, 0, Math.PI * 2); ctx.fillStyle = '#ff00ff'; ctx.fill();
+
+            for (let i = bullets.length - 1; i >= 0; i--) {
+                let b = bullets[i]; b.x += b.vx; b.y += b.vy;
+                ctx.beginPath(); ctx.arc(b.x, b.y, b.radius, 0, Math.PI * 2); ctx.fillStyle = (b.type === "in" ? '#00ff66' : '#ff3333'); ctx.fill();
+
+                // 初めて操作エリア（画面内）に入った玉を1発として数える
+                if (!b.entered && b.x >= 0 && b.x <= canvas.width && b.y >= 0 && b.y <= canvas.height) {
+                    b.entered = true; enteredCount++;
+                    if (enteredCount % BURST_COUNT === 0) restUntil = now + REST_MS;
+                }
+
+                // 赤玉・緑玉どちらでも、バーに向かって進んでいる間は何度でも跳ね返る（反射のたびに1.2倍、上限あり）
+                const MAX_SPD = 14;
+                if (b.vx > 0 && b.x + b.radius >= canvas.width - thick && b.y >= ty0 && b.y <= ty1) {
+                    b.vx = -Math.abs(b.vx) * 1.2; b.type = "back";
+                    const sp = Math.hypot(b.vx, b.vy); if (sp > MAX_SPD) { b.vx *= MAX_SPD / sp; b.vy *= MAX_SPD / sp; }
+                    continue;
+                }
+                if (b.vy > 0 && b.y + b.radius >= canvas.height - thick && b.x >= tx0 && b.x <= tx1) {
+                    b.vy = -Math.abs(b.vy) * 1.2; b.type = "back";
+                    const sp = Math.hypot(b.vx, b.vy); if (sp > MAX_SPD) { b.vx *= MAX_SPD / sp; b.vy *= MAX_SPD / sp; }
+                    continue;
+                }
+
+                if (Math.sqrt((b.x - playerX)**2 + (b.y - playerY)**2) < playerRadius + b.radius) {
+                    if (b.type === "back") { bullets.splice(i, 1); score++; scoreByType[b.speedType]++; } else { isState = "GAMEOVER"; goScreen.style.display = 'block'; return; } continue;
+                }
+                if (Math.hypot(b.x - canvas.width / 2, b.y - canvas.height / 2) > b.initialDist + 300) bullets.splice(i, 1);
+            }
+
+            // ミニマップの描画処理をループに同期
+            drawMinimap(bX, bY, 0, thick, maxW, maxH);
+            requestAnimationFrame(gameLoop);
+        }
+
+        function resetGame() {
+            bullets = []; score = 0; scoreByType = [0, 0, 0]; isState = "PLAYING"; isDragging = false; for (const k in keys) keys[k] = false; goScreen.style.display = 'none'; gcScreen.style.display = 'none';
+            playerX = window.innerWidth / 2; playerY = window.innerHeight / 2;
+window.scrollTo((document.documentElement.scrollWidth - document.documentElement.clientWidth) / 2, (document.documentElement.scrollHeight - document.documentElement.clientHeight) / 2);
+lastSpawn = 0; enteredCount = 0; restUntil = 0; gameLoop();
+}
+setTimeout(resetGame, 200);
+</script>
+</body>
+</html>
